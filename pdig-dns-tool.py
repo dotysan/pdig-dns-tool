@@ -2,6 +2,8 @@
 # /// script
 # dependencies = [
 #     "dnspython",
+#     "netifaces",
+#     "numpy",
 #     "requests",
 # ]
 # ///
@@ -15,42 +17,25 @@
 
 import argparse
 import contextlib
-#import json
+import json
 import os
 from pathlib import Path
-import requests
 import socket
 import statistics
 import sys
 import tempfile
 import time
 
-# statistics stuff at the end
-# import random
-# try:
-#     import numpy.random
-# except:
-#     print("apt install python3-numpy or pip3 install numpy")
-#     sys.exit(1)
-
 # 3rd party imports
-try:
-    import dns
-    import dns.message
-    import dns.query
-    import dns.rdatatype
-    import dns.resolver
-    import dns.zone
-except:
-    print("apt install python3-dnspython or pip3 install dnspython")
-    sys.exit(1)
-
-# apt install python3-netifaces
-#try:
-#    import netifaces
-#except:
-#    print("apt install python3-netifaces or pip3 install netifaces")
-#    sys.exit(0)
+import dns
+import dns.message
+import dns.query
+import dns.rdatatype
+import dns.resolver
+import dns.zone
+import netifaces
+import numpy.random
+import requests
 
 addrinfo_cache = []
 
