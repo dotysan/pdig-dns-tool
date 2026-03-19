@@ -14,8 +14,10 @@
 """
 
 import argparse
+import contextlib
 #import json
 import os
+from pathlib import Path
 import requests
 import socket
 import statistics
@@ -461,6 +463,29 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
 # end query_domain
 
 
+def upload_report_file(fn_path: Path, url: str) -> None:
+    """Upload a report file and remove it after the upload attempt."""
+    try:
+        with fn_path.open("rb") as f:
+            post_response = requests.post(
+                url,
+                data={'file': str(fn_path)},
+                files={'file': f},
+                timeout=10,
+                verify=True,
+            )
+        if post_response.ok:
+            print("Upload successful:", post_response.text)
+        else:
+            print(f"Upload failed with status code: {post_response.status_code}")
+
+    except (requests.RequestException, OSError) as e:
+        print(f"Error during upload: {e}")
+    finally:
+        with contextlib.suppress(OSError):
+            fn_path.unlink()
+
+
 def main() -> None:
     """ Parse command-line arguments, query each requested domain, and optionally save/upload reports. """
 
@@ -493,37 +518,15 @@ def main() -> None:
     for domain in args.domains:
         print(f"\nProcessing domain: {domain}")
         print("=" * 50)
+
         fn = query_domain(domain, args, socket_af_types, verbose=args.verbose)
-        if fn is not None:
-            print(f"fn={fn}")
-            if args.upload:
-                try:
-                    with open(fn, "rb") as f:
-                        post_response = requests.post(
-                            url,
-                            data={'file': fn},
-                            files={'file': f},
-                            timeout=10,
-                            verify=True
-                        )
-                        if post_response.status_code == 200:
-                            print("Upload successful:", post_response.text)
-                            try:
-                                os.unlink(fn)
-                            except OSError as e:
-                                print(f"Warning: Could not delete temporary file {fn}: {e}")
-                        else:
-                            print(f"Upload failed with status code: {post_response.status_code}")
-                            try:
-                                os.unlink(fn)  # Clean up file even on failed upload
-                            except OSError:
-                                pass
-                except (requests.RequestException, IOError) as e:
-                    print(f"Error during upload: {e}")
-                    try:
-                        os.unlink(fn)  # Clean up file on exception
-                    except OSError:
-                        pass
+        if fn is None:
+            print("=" * 50)
+            continue
+
+        print(f"fn={fn}")
+        if args.upload:
+            upload_report_file(Path(fn), url)
         print("=" * 50)
 
     # internal statistics
