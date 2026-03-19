@@ -454,20 +454,7 @@ def _print_query_statistics(all_query_stats: list[dict], fd: int | None) -> None
     print("=" * 50)
 
     # Group by TTL ranges
-    ttl_ranges = {}
-    for stat in all_query_stats:
-        ttl_key = f"{stat['nameserver']}"
-        if ttl_key not in ttl_ranges:
-            ttl_ranges[ttl_key] = {
-                'count': 0,
-                'latencies': [],
-                'nameservers': set(),
-                'ttl': None,
-            }
-        ttl_ranges[ttl_key]['count'] += 1
-        ttl_ranges[ttl_key]['latencies'].append(stat['latency'])
-        ttl_ranges[ttl_key]['nameservers'].add(stat['nameserver'])
-        ttl_ranges[ttl_key]['ttl'] = stat['ttl']
+    ttl_ranges = _group_stats_by_delegation(all_query_stats)
 
     avg_list = []
     min_list = []
@@ -478,42 +465,7 @@ def _print_query_statistics(all_query_stats: list[dict], fd: int | None) -> None
 
     # Calculate and display statistics for each TTL range
     for delegation, data in ttl_ranges.items():
-        avg_latency = statistics.mean(data['latencies'])
-        min_latency = min(data['latencies'])
-        max_latency = max(data['latencies'])
-        stddev = statistics.stdev(data['latencies']) if len(data['latencies']) > 1 else 0
-
-        # Find IP addresses and nameservers associated with min and max latencies
-        min_ip = None
-        max_ip = None
-        min_ns = None
-        max_ns = None
-        for stat in all_query_stats:
-            if stat['nameserver'] != delegation:
-                continue
-            if stat['latency'] == min_latency:
-                min_ip = stat['ip']
-                # Find the nameserver that maps to this IP
-                for ns_stat in all_query_stats:
-                    if ns_stat['ip'] == min_ip:
-                        min_ns = ns_stat['nsname']
-                        break
-            if stat['latency'] == max_latency:
-                max_ip = stat['ip']
-                # Find the nameserver that maps to this IP
-                for ns_stat in all_query_stats:
-                    if ns_stat['ip'] == max_ip:
-                        max_ns = ns_stat['nsname']
-                        break
-
-        print(f"\nDelegation: {delegation}")
-        print(f"Number of queries: {data['count']}")
-        print(f"TTL: {data['ttl']}")
-        print("Latency statistics (ms):")
-        print(f"  Average: {avg_latency:.2f}")
-        print(f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
-        print(f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
-        print(f"  StdDev: {stddev:.2f}")
+        avg_latency, min_latency, max_latency, stddev = _print_delegation_stats(delegation, data, all_query_stats, fd)
 
         avg_list.append(avg_latency)
         min_list.append(min_latency)
@@ -521,15 +473,6 @@ def _print_query_statistics(all_query_stats: list[dict], fd: int | None) -> None
         stddev_list.append(stddev)
         ttl_list.append(data['ttl'])
         count_list.append(data['count'])
-
-        _write_report_line(fd, f"\nDelegation: {delegation}")
-        _write_report_line(fd, f"Number of queries: {data['count']}")
-        _write_report_line(fd, f"TTL: {data['ttl']}")
-        _write_report_line(fd, "Latency statistics (ms):")
-        _write_report_line(fd, f"  Average: {avg_latency:.2f}")
-        _write_report_line(fd, f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
-        _write_report_line(fd, f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
-        _write_report_line(fd, f"  StdDev: {stddev:.2f}")
 
 ##     rtt_val = 0.0
 ##     ttl_pct = 0
@@ -547,6 +490,68 @@ def _print_query_statistics(all_query_stats: list[dict], fd: int | None) -> None
 ##     ttl_pct = ttl_pct * 100.0
 ##     # likelyhood that any given ttl might expire at any given second
 ##     print(f"ttl_pct={ttl_pct:.5f}")
+
+
+def _group_stats_by_delegation(all_query_stats: list[dict]) -> dict:
+    """ Group query statistics by delegation point. """
+
+    ttl_ranges = {}
+    for stat in all_query_stats:
+        ttl_key = f"{stat['nameserver']}"
+        if ttl_key not in ttl_ranges:
+            ttl_ranges[ttl_key] = {
+                'count': 0,
+                'latencies': [],
+                'nameservers': set(),
+                'ttl': None,
+            }
+        ttl_ranges[ttl_key]['count'] += 1
+        ttl_ranges[ttl_key]['latencies'].append(stat['latency'])
+        ttl_ranges[ttl_key]['nameservers'].add(stat['nameserver'])
+        ttl_ranges[ttl_key]['ttl'] = stat['ttl']
+    return ttl_ranges
+
+
+def _print_delegation_stats(delegation: str, data: dict, all_query_stats: list[dict], fd: int | None) -> tuple:
+    """Calculate and print statistics for a single delegation."""
+
+    avg_latency = statistics.mean(data['latencies'])
+    min_latency = min(data['latencies'])
+    max_latency = max(data['latencies'])
+    stddev = statistics.stdev(data['latencies']) if len(data['latencies']) > 1 else 0
+
+    min_ip, min_ns = _find_extremum_info(all_query_stats, delegation, min_latency)
+    max_ip, max_ns = _find_extremum_info(all_query_stats, delegation, max_latency)
+
+    print(f"\nDelegation: {delegation}")
+    print(f"Number of queries: {data['count']}")
+    print(f"TTL: {data['ttl']}")
+    print("Latency statistics (ms):")
+    print(f"  Average: {avg_latency:.2f}")
+    print(f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
+    print(f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
+    print(f"  StdDev: {stddev:.2f}")
+
+    _write_report_line(fd, f"\nDelegation: {delegation}")
+    _write_report_line(fd, f"Number of queries: {data['count']}")
+    _write_report_line(fd, f"TTL: {data['ttl']}")
+    _write_report_line(fd, "Latency statistics (ms):")
+    _write_report_line(fd, f"  Average: {avg_latency:.2f}")
+    _write_report_line(fd, f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
+    _write_report_line(fd, f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
+    _write_report_line(fd, f"  StdDev: {stddev:.2f}")
+
+    return (avg_latency, min_latency, max_latency, stddev)
+
+
+def _find_extremum_info(all_query_stats: list[dict], delegation: str, latency_value: float) -> tuple[str | None, str | None]:
+    """Find IP and nameserver info for a given latency value in a delegation."""
+    for stat in all_query_stats:
+        if stat['nameserver'] == delegation and stat['latency'] == latency_value:
+            ip = stat['ip']
+            ns = next((s['nsname'] for s in all_query_stats if s['ip'] == ip), None)
+            return (ip, ns)
+    return (None, None)
 
 
 def has_ipv6_connectivity() -> bool:
