@@ -460,69 +460,75 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
     return filename
 # end query_domain
 
-# main()
 
-# define a parser
-parser = argparse.ArgumentParser(prog=sys.argv[0])
-parser.add_argument('domains', nargs='+', help="one or more domain names to query") # allow multiple domains
+def main() -> None:
+    """ Parse command-line arguments, query each requested domain, and optionally save/upload reports. """
 
-ip_group = parser.add_mutually_exclusive_group()
-ip_group.add_argument('-4', '--ipv4', action='store_true', help="query ipv4-only")  # ipv6-only
-ip_group.add_argument('-6', '--ipv6', action='store_true', help="query ipv6-only")  # ipv4-only
+    # define a parser
+    parser = argparse.ArgumentParser(prog=sys.argv[0])
+    parser.add_argument('domains', nargs='+', help="one or more domain names to query")  # allow multiple domains
 
-parser.add_argument('-t', '--tcp', action='store_true', help="send queries over TCP") # use TCP
-parser.add_argument('-r', '--report', metavar='REPORT_FILE', type=str, help="Save results to specified file")
-parser.add_argument('-g', '--gt', action='store_true', help="greater than 100ms only")
-parser.add_argument('-u', '--upload', action='store_true', help="requires -r - uploads report to hardcoded url")
-parser.add_argument('-v', '--verbose', action='store_true', help="enable verbose debugging output")
+    ip_group = parser.add_mutually_exclusive_group()
+    ip_group.add_argument('-4', '--ipv4', action='store_true', help="query ipv4-only")  # ipv6-only
+    ip_group.add_argument('-6', '--ipv6', action='store_true', help="query ipv6-only")  # ipv4-only
 
-args = parser.parse_args()
+    parser.add_argument('-t', '--tcp', action='store_true', help="send queries over TCP")  # use TCP
+    parser.add_argument('-r', '--report', metavar='REPORT_FILE', type=str, help="Save results to specified file")
+    parser.add_argument('-g', '--gt', action='store_true', help="greater than 100ms only")
+    parser.add_argument('-u', '--upload', action='store_true', help="requires -r - uploads report to hardcoded url")
+    parser.add_argument('-v', '--verbose', action='store_true', help="enable verbose debugging output")
 
-socket_af_types = (
-    [socket.AF_INET] if args.ipv4 else
-    [socket.AF_INET6] if args.ipv6 else
-    [socket.AF_INET, socket.AF_INET6]
-)
+    args = parser.parse_args()
 
-# XXX Replace me if you are going to use -u flag
-url = "https://www.example.com/upload/upload_file.php"
+    socket_af_types = (
+        [socket.AF_INET] if args.ipv4 else
+        [socket.AF_INET6] if args.ipv6 else
+        [socket.AF_INET, socket.AF_INET6]
+    )
 
-# Iterate through all specified domains
-for domain in args.domains:
-    print(f"\nProcessing domain: {domain}")
-    print("=" * 50)
-    fn = query_domain(domain, args, socket_af_types, verbose=args.verbose)
-    if fn is not None:
-        print(f"fn={fn}")
-        if args.upload:
-            try:
-                with open(fn, "rb") as f:
-                    post_response = requests.post(
-                        url,
-                        data={'file': fn},
-                        files={'file': f},
-                        timeout=10,
-                        verify=True
-                    )
-                    if post_response.status_code == 200:
-                        print("Upload successful:", post_response.text)
-                        try:
-                            os.unlink(fn)
-                        except OSError as e:
-                            print(f"Warning: Could not delete temporary file {fn}: {e}")
-                    else:
-                        print(f"Upload failed with status code: {post_response.status_code}")
-                        try:
-                            os.unlink(fn)  # Clean up file even on failed upload
-                        except OSError:
-                            pass
-            except (requests.RequestException, IOError) as e:
-                print(f"Error during upload: {e}")
+    # XXX Replace me if you are going to use -u flag
+    url = "https://www.example.com/upload/upload_file.php"
+
+    # Iterate through all specified domains
+    for domain in args.domains:
+        print(f"\nProcessing domain: {domain}")
+        print("=" * 50)
+        fn = query_domain(domain, args, socket_af_types, verbose=args.verbose)
+        if fn is not None:
+            print(f"fn={fn}")
+            if args.upload:
                 try:
-                    os.unlink(fn)  # Clean up file on exception
-                except OSError:
-                    pass
-    print("=" * 50)
+                    with open(fn, "rb") as f:
+                        post_response = requests.post(
+                            url,
+                            data={'file': fn},
+                            files={'file': f},
+                            timeout=10,
+                            verify=True
+                        )
+                        if post_response.status_code == 200:
+                            print("Upload successful:", post_response.text)
+                            try:
+                                os.unlink(fn)
+                            except OSError as e:
+                                print(f"Warning: Could not delete temporary file {fn}: {e}")
+                        else:
+                            print(f"Upload failed with status code: {post_response.status_code}")
+                            try:
+                                os.unlink(fn)  # Clean up file even on failed upload
+                            except OSError:
+                                pass
+                except (requests.RequestException, IOError) as e:
+                    print(f"Error during upload: {e}")
+                    try:
+                        os.unlink(fn)  # Clean up file on exception
+                    except OSError:
+                        pass
+        print("=" * 50)
 
-# internal statistics
-#print(f"addrinfo_cache_hits={addrinfo_cache_hits} - cache size:", len(addrinfo_cache))
+    # internal statistics
+    # print(f"addrinfo_cache_hits={addrinfo_cache_hits} - cache size:", len(addrinfo_cache))
+
+
+if __name__ == '__main__':
+    main()
