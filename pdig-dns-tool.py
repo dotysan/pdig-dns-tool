@@ -25,7 +25,6 @@ from pathlib import Path
 import socket
 import statistics
 import sys
-import tempfile
 import time
 from typing import TYPE_CHECKING
 
@@ -38,8 +37,6 @@ import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
 import dns.resolver
-import dns.zone
-import netifaces
 import numpy.random
 import requests
 
@@ -287,197 +284,252 @@ def query_domain(
         *,
         verbose: bool = False,
     ) -> str | None:
-    """ query_domain starts the top of the query chain for each domain """
+    """Start the top of the query chain for a domain.
 
-    root_hints = []
-    all_ips = {}
-    all_query_stats = []  # Store all query statistics
+    Args:
+        fqdn: Fully qualified domain name to query.
+        cli_args: Parsed command-line arguments.
+        socket_types: Address families to use for DNS lookups.
+        verbose: Enable verbose debug output when True.
+
+    Returns:
+        The report filename when report output is enabled and created successfully;
+        otherwise ``None``.
+    """
 
     print(f"querying for {fqdn}")
 
-    fd = None
-    filename = None
-    if cli_args.report:
-        filename = cli_args.report
-        try:
-            fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-            with os.fdopen(fd, 'wb') as f:
-                f.write(str.encode(f"querying for {fqdn}\n"))
-                ts = time.ctime()
-                print(f"start={ts}")
-                f.write(str.encode(f"start={ts}\n"))
-        except OSError as e:
-            print(f"Error creating report file '{filename}': {e}")
-            return None
+    fd, filename = _open_report_file(cli_args.report, fqdn)
+    if cli_args.report and fd is None:
+        return None
 
     # preseed the data
+    root_hints = _seed_root_hints(cli_args.tcp, socket_types, verbose, fd)
+    if root_hints is None:
+        if fd is not None:
+            os.close(fd)
+        return None
+
+    all_ips = {}
+    # run through the domain tree until done
+    all_query_stats = _run_query_chain(fqdn, root_hints, cli_args, fd, all_ips, socket_types)
+
+    ts = time.ctime()
+    print(f"end={ts}")
+    if fd is not None:
+        _write_report_line(fd, f"end={ts}")
+        _write_identity_queries(fd, all_ips, ts)
+
+    # After the main query loop, analyze and output the statistics
+    _print_query_statistics(all_query_stats, fd)
+
+    if fd is not None:
+        os.close(fd)
+        print(filename)
+    return filename
+
+
+def _open_report_file(report_path: str | None, fqdn: str) -> tuple[int | None, str | None]:
+    if not report_path:
+        return (None, None)
+
     try:
-        response = dns.resolver.resolve(".", "NS", lifetime=10, tcp=cli_args.tcp)
+        fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    except OSError as e:
+        print(f"Error creating report file '{report_path}': {e}")
+        return (None, None)
+
+    ts = time.ctime()
+    print(f"start={ts}")
+    _write_report_line(fd, f"querying for {fqdn}")
+    _write_report_line(fd, f"start={ts}")
+    return (fd, report_path)
+
+
+def _seed_root_hints(
+        tcp: bool,
+        socket_types: Sequence[socket.AddressFamily | int],
+        verbose: bool,
+        fd: int | None,
+    ) -> list[dict] | None:
+    try:
+        response = dns.resolver.resolve(".", "NS", lifetime=10, tcp=tcp)
         if verbose:
             print(f"[VERBOSE] Successfully resolved root NS records: {response}")
     except (dns.resolver.NoNameservers, dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.Timeout) as e:
-        print(f"Failed to resolve root nameservers: {e}")
-        if fd is not None:
-            os.write(fd, str.encode(f"Failed to resolve root nameservers: {e}\n"))
-            os.close(fd)
+        msg = f"Failed to resolve root nameservers: {e}"
+        print(msg)
+        _write_report_line(fd, msg)
         return None
     except (dns.exception.DNSException, OSError) as e:
-        print(f"Unexpected error resolving root nameservers: {e}")
-        if fd is not None:
-            os.write(fd, str.encode(f"Unexpected error resolving root nameservers: {e}\n"))
-            os.close(fd)
+        msg = f"Unexpected error resolving root nameservers: {e}"
+        print(msg)
+        _write_report_line(fd, msg)
         return None
 
+    root_hints = []
     for var in response.response.answer:
         for i in var.items:
+            str_name = str(i.to_text())
             for fam in socket_types:
-                try:
-                    add_info = socket.getaddrinfo(host=i.to_text(), port=None, family=fam)
-                    if verbose:
-                        print(f"[VERBOSE] getaddrinfo for {i.to_text()} (family {fam}): {add_info}")
-                except socket.gaierror as e:
-                    if verbose:
-                        print(f"[VERBOSE] socket.gaierror for {i.to_text()} (family {fam}): {e}")
+                add_info = cached_getaddrinfo(str_name, None, fam)
+                if verbose:
+                    print(f"[VERBOSE] getaddrinfo for {str_name} (family {fam}): {add_info}")
+                if add_info is None:
                     continue
-                str_name = str(i.to_text())
                 for a in add_info:
                     addr_list = a[4]
                     root_hints.append({'qname': str_name, 'af_type': a[0], 'addrinfo': addr_list[0]})
                     if verbose:
                         print(f"[VERBOSE] Added root hint: qname={str_name}, af_type={a[0]}, addrinfo={addr_list[0]}")
+
     if len(root_hints) == 0:
         print("No root hints found after processing root NS records!")
-    old_cache = root_hints
+    return root_hints
 
-    # run through the domain tree until done
+
+def _run_query_chain(
+        fqdn: str,
+        root_hints: list[dict],
+        cli_args: argparse.Namespace,
+        fd: int | None,
+        all_ips: dict,
+        socket_types: Sequence[socket.AddressFamily | int],
+    ) -> list[dict]:
+    all_query_stats = []
+    old_cache = root_hints
+    af_to_qtype: dict[int, dns.rdatatype.RdataType] = {
+        socket.AF_INET: dns.rdatatype.A,
+        socket.AF_INET6: dns.rdatatype.AAAA,
+    }
+
     while len(old_cache) > 0:
-        af_to_qtype: dict[int, dns.rdatatype.RdataType] = {
-            socket.AF_INET: dns.rdatatype.A,
-            socket.AF_INET6: dns.rdatatype.AAAA,
-        }
         qtype_list = [af_to_qtype[af] for af in socket_types]
         (reply_hints, new_domain, query_stats) = query_all(
             fqdn, old_cache, qtype_list, cli_args.tcp, fd, cli_args.gt, all_ips, socket_types)
         all_query_stats.extend(query_stats)
         old_cache = reply_hints
         if new_domain is not None:
-            print(f"(re)querying for {fqdn} due to CNAME to {new_domain}")
-            if fd is not None:
-                os.write(fd, str.encode(f"(re)querying for {fqdn} due to CNAME to {new_domain}" + '\n'))
+            msg = f"(re)querying for {fqdn} due to CNAME to {new_domain}"
+            print(msg)
+            _write_report_line(fd, msg)
             fqdn = new_domain
             old_cache = root_hints
         print("===================")
-        if fd is not None:
-            os.write(fd, str.encode("===================" + "\n"))
+        _write_report_line(fd, "===================")
 
-    ts = time.ctime()
-    print(f"end={ts}")
-    if fd is not None and filename is not None:
+    return all_query_stats
+
+
+def _write_report_line(fd: int | None, line: str) -> None:
+    if fd is None:
+        return
+    os.write(fd, str.encode(line + '\n'))
+
+
+def _write_identity_queries(fd: int, all_ips: dict, ts: str) -> None:
+    for ip in all_ips:
+        _write_report_line(fd, f"# {ip}")
+        _write_report_line(fd, f"dig +noall +answer +stats @{ip} identity.nameserver.id ch txt")
+        identity = dns.message.make_query("identity.nameserver.id", dns.rdatatype.TXT, rdclass=dns.rdataclass.CHAOS)
         try:
-            fd = os.open(filename, os.O_WRONLY | os.O_APPEND)
-            os.write(fd, str.encode(f"end={ts}" + '\n'))
-            for ip in all_ips:
-                os.write(fd, str.encode(f"# {ip}\n"))
-                os.write(fd, str.encode(f"dig +noall +answer +stats @{ip} identity.nameserver.id ch txt\n"))
-                identity = dns.message.make_query("identity.nameserver.id", dns.rdatatype.TXT, rdclass=dns.rdataclass.CHAOS)
-                try:
-                    resp =  dns.query.udp(identity, ip, timeout=10)
-                    for var in resp.answer:
-                        for i in var.items:
-                            msg = f'"{ts}";"{ip}";{i}'
-                            os.write(fd, str.encode(msg + '\n'))
-                            print(msg)
-                except (dns.exception.DNSException, OSError) as e:
-                    print(f"{e}:{ip}")
-                    os.write(fd, str.encode(f"{e}:{ip}"))
-                os.write(fd, str.encode(f"mtr -bw {ip}\n"))
-        except OSError as e:
-            print(f"Warning: Could not write to report file: {e}")
-        finally:
-            os.close(fd)
+            resp = dns.query.udp(identity, ip, timeout=10)
+            for var in resp.answer:
+                for i in var.items:
+                    msg = f'"{ts}";"{ip}";{i}'
+                    _write_report_line(fd, msg)
+                    print(msg)
+        except (dns.exception.DNSException, OSError) as e:
+            msg = f"{e}:{ip}"
+            print(msg)
+            _write_report_line(fd, msg)
+        _write_report_line(fd, f"mtr -bw {ip}")
 
-    # After the main query loop, analyze and output the statistics
-    if all_query_stats:
-        print("\nQuery Statistics Analysis:")
-        print("=" * 50)
 
-        # Group by TTL ranges
-        ttl_ranges = {}
+def _print_query_statistics(all_query_stats: list[dict], fd: int | None) -> None:
+    if not all_query_stats:
+        return
+
+    print("\nQuery Statistics Analysis:")
+    print("=" * 50)
+
+    # Group by TTL ranges
+    ttl_ranges = {}
+    for stat in all_query_stats:
+        ttl_key = f"{stat['nameserver']}"
+        if ttl_key not in ttl_ranges:
+            ttl_ranges[ttl_key] = {
+                'count': 0,
+                'latencies': [],
+                'nameservers': set(),
+                'ttl': None,
+            }
+        ttl_ranges[ttl_key]['count'] += 1
+        ttl_ranges[ttl_key]['latencies'].append(stat['latency'])
+        ttl_ranges[ttl_key]['nameservers'].add(stat['nameserver'])
+        ttl_ranges[ttl_key]['ttl'] = stat['ttl']
+
+    avg_list = []
+    min_list = []
+    max_list = []
+    stddev_list = []
+    ttl_list = []
+    count_list = []
+
+    # Calculate and display statistics for each TTL range
+    for delegation, data in ttl_ranges.items():
+        avg_latency = statistics.mean(data['latencies'])
+        min_latency = min(data['latencies'])
+        max_latency = max(data['latencies'])
+        stddev = statistics.stdev(data['latencies']) if len(data['latencies']) > 1 else 0
+
+        # Find IP addresses and nameservers associated with min and max latencies
+        min_ip = None
+        max_ip = None
+        min_ns = None
+        max_ns = None
         for stat in all_query_stats:
-            ttl_key = f"{stat['nameserver']}"
-            if ttl_key not in ttl_ranges:
-                ttl_ranges[ttl_key] = {
-                    'count': 0,
-                    'latencies': [],
-                    'nameservers': set(),
-                    'ttl': None,
-                }
-            ttl_ranges[ttl_key]['count'] += 1
-            ttl_ranges[ttl_key]['latencies'].append(stat['latency'])
-            ttl_ranges[ttl_key]['nameservers'].add(stat['nameserver'])
-            ttl_ranges[ttl_key]['ttl'] = stat['ttl']
+            if stat['nameserver'] != delegation:
+                continue
+            if stat['latency'] == min_latency:
+                min_ip = stat['ip']
+                # Find the nameserver that maps to this IP
+                for ns_stat in all_query_stats:
+                    if ns_stat['ip'] == min_ip:
+                        min_ns = ns_stat['nsname']
+                        break
+            if stat['latency'] == max_latency:
+                max_ip = stat['ip']
+                # Find the nameserver that maps to this IP
+                for ns_stat in all_query_stats:
+                    if ns_stat['ip'] == max_ip:
+                        max_ns = ns_stat['nsname']
+                        break
 
-        avg_list = []
-        min_list = []
-        max_list = []
-        stddev_list = []
-        ttl_list = []
-        count_list = []
+        print(f"\nDelegation: {delegation}")
+        print(f"Number of queries: {data['count']}")
+        print(f"TTL: {data['ttl']}")
+        print("Latency statistics (ms):")
+        print(f"  Average: {avg_latency:.2f}")
+        print(f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
+        print(f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
+        print(f"  StdDev: {stddev:.2f}")
 
-        # Calculate and display statistics for each TTL range
-        for delegation, data in ttl_ranges.items():
-            avg_latency = statistics.mean(data['latencies'])
-            min_latency = min(data['latencies'])
-            max_latency = max(data['latencies'])
-            stddev = statistics.stdev(data['latencies']) if len(data['latencies']) > 1 else 0
+        avg_list.append(avg_latency)
+        min_list.append(min_latency)
+        max_list.append(max_latency)
+        stddev_list.append(stddev)
+        ttl_list.append(data['ttl'])
+        count_list.append(data['count'])
 
-            # Find IP addresses and nameservers associated with min and max latencies
-            min_ip = None
-            max_ip = None
-            min_ns = None
-            max_ns = None
-            for stat in all_query_stats:
-                if stat['nameserver'] == delegation:
-                    if stat['latency'] == min_latency:
-                        min_ip = stat['ip']
-                        # Find the nameserver that maps to this IP
-                        for ns_stat in all_query_stats:
-                            if ns_stat['ip'] == min_ip:
-                                min_ns = ns_stat['nsname']
-                                break
-                    if stat['latency'] == max_latency:
-                        max_ip = stat['ip']
-                        # Find the nameserver that maps to this IP
-                        for ns_stat in all_query_stats:
-                            if ns_stat['ip'] == max_ip:
-                                max_ns = ns_stat['nsname']
-                                break
-
-            print(f"\nDelegation: {delegation}")
-            print(f"Number of queries: {data['count']}")
-            print(f"TTL: {data['ttl']}")
-            print("Latency statistics (ms):")
-            print(f"  Average: {avg_latency:.2f}")
-            print(f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
-            print(f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
-            print(f"  StdDev: {stddev:.2f}")
-
-            avg_list.append(avg_latency)
-            min_list.append(min_latency)
-            max_list.append(max_latency)
-            stddev_list.append(stddev)
-            ttl_list.append(data['ttl'])
-            count_list.append(data['count'])
-
-            if fd is not None:
-                os.write(fd, str.encode(f"\nDelegation: {delegation}\n"))
-                os.write(fd, str.encode(f"Number of queries: {data['count']}\n"))
-                os.write(fd, str.encode(f"TTL: {data['ttl']}\n"))
-                os.write(fd, str.encode("Latency statistics (ms):\n"))
-                os.write(fd, str.encode(f"  Average: {avg_latency:.2f}\n"))
-                os.write(fd, str.encode(f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})\n"))
-                os.write(fd, str.encode(f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})\n"))
-                os.write(fd, str.encode(f"  StdDev: {stddev:.2f}\n"))
+        _write_report_line(fd, f"\nDelegation: {delegation}")
+        _write_report_line(fd, f"Number of queries: {data['count']}")
+        _write_report_line(fd, f"TTL: {data['ttl']}")
+        _write_report_line(fd, "Latency statistics (ms):")
+        _write_report_line(fd, f"  Average: {avg_latency:.2f}")
+        _write_report_line(fd, f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
+        _write_report_line(fd, f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
+        _write_report_line(fd, f"  StdDev: {stddev:.2f}")
 
 ##     rtt_val = 0.0
 ##     ttl_pct = 0
@@ -495,12 +547,6 @@ def query_domain(
 ##     ttl_pct = ttl_pct * 100.0
 ##     # likelyhood that any given ttl might expire at any given second
 ##     print(f"ttl_pct={ttl_pct:.5f}")
-
-    if fd is not None:
-        os.close(fd)
-        print(filename)
-    return filename
-# end query_domain
 
 
 def has_ipv6_connectivity() -> bool:
