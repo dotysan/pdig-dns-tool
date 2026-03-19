@@ -9,15 +9,17 @@
 # ///
 
 """
-# ask each NS in the query for the domainname
-# for answers and record response times for
-# each address family, IP address, transport and authority
+DNS latency measurement tool that walks the delegation chain from root
+nameservers to authoritative servers, measuring response times at each step.
 
+Reports per-query latency and aggregated statistics (min, max, avg, stddev)
+for each delegation point. Supports IPv4/IPv6, UDP/TCP, and optional reporting.
 """
 
 import argparse
 import contextlib
 import json
+import operator
 import os
 from pathlib import Path
 import socket
@@ -25,11 +27,15 @@ import statistics
 import sys
 import tempfile
 import time
+from typing import TYPE_CHECKING
 
 # 3rd party imports
-import dns
+import dns.exception
+import dns.flags
 import dns.message
 import dns.query
+import dns.rcode
+import dns.rdataclass
 import dns.rdatatype
 import dns.resolver
 import dns.zone
@@ -37,42 +43,59 @@ import netifaces
 import numpy.random
 import requests
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 addrinfo_cache = []
 
 addrinfo_cache_hits = 0
 
-def cached_getaddrinfo(hostname, port, family):
+
+def cached_getaddrinfo(
+        hostname: str,
+        port: int | str | None,
+        family: socket.AddressFamily | int,
+    ) -> list[tuple] | None:
+    """ Return cached getaddrinfo results for a host/family pair, or resolve and cache them.
+
+    Returns:
+        Cached or newly resolved ``socket.getaddrinfo()`` results for the given
+        host and address family, or ``None`` if resolution fails.
+    """
+
     global addrinfo_cache_hits
     for a in addrinfo_cache:
         if a.get('hostname') == hostname and a.get('family') == family:
-            addrinfo_cache_hits = addrinfo_cache_hits + 1
+            addrinfo_cache_hits += 1
             return a.get('cache')
     try:
         add_info = socket.getaddrinfo(host=hostname, port=port, family=family)
     except socket.gaierror as e:
-        if e.errno == -2: # Name or service not known
-            add_entry = { "hostname": hostname, "family": family, "cache": None }
+        if e.errno == -2:  # Name or service not known
+            add_entry = {"hostname": hostname, "family": family, "cache": None}
             addrinfo_cache.append(add_entry)
 #        print(f"DNS resolution error for {hostname}: {e.errno}")
         return None
-    except socket.error as e:
+    except OSError as e:
         print(f"Socket error for {hostname}: {e}")
         return None
 
-    add_entry = { "hostname": hostname, "family": family, "cache": add_info }
+    add_entry = {"hostname": hostname, "family": family, "cache": add_info}
     addrinfo_cache.append(add_entry)
     return add_info
 
-# full_qname: domain name to query for
-# prev_cache: list of nameservers to query
-# qtype_list: is array of possible query types
-#     eg: [dns.rdatatype.A, dns.rdatatype.AAAA]
-# tcp: when true, send query over tcp
-#
-def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency, ip_list, socket_types):
-    """
-        query_all handles making the query for each dns server
-    """
+
+def query_all(full_qname: str,  # domain name to query for
+              prev_cache: list,  # list of nameservers to query
+              qtype_list: list,  # is array of possible query types eg: [dns.rdatatype.A, dns.rdatatype.AAAA]
+              tcp: bool,  # when true, send query over tcp
+              file_handle: int | None,
+              high_latency: bool,
+              ip_list: dict,
+              socket_types: Sequence[socket.AddressFamily | int],
+        ) -> tuple:
+    """ query_all handles making the query for each dns server """
+
     # Add new data structure to store TTL and latency info
     query_stats = []
     cname_reply = None
@@ -82,40 +105,45 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
     domain_exists = True
 
     for qtype in qtype_list:
+
         try:
             q = dns.message.make_query(full_qname, qtype)
-        except Exception as e:
+        except (dns.exception.DNSException, ValueError, TypeError) as e:
             print(f"{e}:{full_qname}:{qtype}")
             if file_handle is not None:
                 os.write(file_handle, str.encode(f"{e}:{full_qname}:{qtype}\n"))
+            continue
+
         for x in prev_cache:
-            qip = x['addrinfo']
+            qip: str = x['addrinfo']
             # Skip problematic IPv6 addresses
-            if (qip.startswith('fc') or      # ULA
-                qip.startswith('fd') or      # ULA
-                qip.startswith('fe80::') or  # Link-local
-                qip.startswith('ff') or      # Multicast IPv6
-                qip == '::' or               # Unspecified IPv6
-                qip.startswith('224.') or    # Multicast IPv4
-                qip.startswith('225.') or    # Multicast IPv4
-                qip.startswith('226.') or    # Multicast IPv4
-                qip.startswith('227.') or    # Multicast IPv4
-                qip.startswith('228.') or    # Multicast IPv4
-                qip.startswith('229.') or    # Multicast IPv4
-                qip.startswith('230.') or    # Multicast IPv4
-                qip.startswith('231.') or    # Multicast IPv4
-                qip.startswith('232.') or    # Multicast IPv4
-                qip.startswith('233.') or    # Multicast IPv4
-                qip.startswith('234.') or    # Multicast IPv4
-                qip.startswith('235.') or    # Multicast IPv4
-                qip.startswith('236.') or    # Multicast IPv4
-                qip.startswith('237.') or    # Multicast IPv4
-                qip.startswith('238.') or    # Multicast IPv4
-                qip.startswith('239.') or    # Multicast IPv4
-                qip == '0.0.0.0'):           # Unspecified IPv4
+            if (qip.startswith(('fc',      # ULA
+                                'fd',      # ULA
+                                'fe80::',  # Link-local
+                                'ff',      # Multicast IPv6
+                                '224.',    # Multicast IPv4
+                                '225.',    # Multicast IPv4
+                                '226.',    # Multicast IPv4
+                                '227.',    # Multicast IPv4
+                                '228.',    # Multicast IPv4
+                                '229.',    # Multicast IPv4
+                                '230.',    # Multicast IPv4
+                                '231.',    # Multicast IPv4
+                                '232.',    # Multicast IPv4
+                                '233.',    # Multicast IPv4
+                                '234.',    # Multicast IPv4
+                                '235.',    # Multicast IPv4
+                                '236.',    # Multicast IPv4
+                                '237.',    # Multicast IPv4
+                                '238.',    # Multicast IPv4
+                                '239.'))
+                or qip in {
+                                '::',      # Unspecified IPv6
+                                '0.0.0.0'  # Unspecified IPv4
+                }):
                 continue
             # check if we have talked to this IP + QTYPE this round
-            if query_ip.get(qip + str(qtype), None) is None:
+            if query_ip.get(qip + str(qtype)) is None:
                 query_ip[qip + str(qtype)] = 1
 
                 # store list of all IPs
@@ -124,10 +152,7 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
                 # timer
                 start_time = time.time()
                 try:
-                    if tcp:
-                        resp = dns.query.tcp(q, qip, timeout=3)
-                    else:
-                        resp =  dns.query.udp(q, qip, timeout=3)
+                    resp = dns.query.tcp(q, qip, timeout=3) if tcp else dns.query.udp(q, qip, timeout=3)
                     stop_time = time.time()
 
                     latency = stop_time - start_time
@@ -135,9 +160,13 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
                     times.append(latency_ms)
 
                     if latency_ms > 100 or high_latency is False:
-                        print(f"ns={x['qname']}, qtype={dns.rdatatype.to_text(qtype)}, addr={qip}, latency={latency_ms:.3f} ms")
+                        log_line = (
+                            f"ns={x['qname']}, qtype={dns.rdatatype.to_text(qtype)}, "
+                            f"addr={qip}, latency={latency_ms:.3f} ms"
+                        )
+                        print(log_line)
                         if file_handle is not None:
-                            os.write(file_handle, str.encode(f"ns={x['qname']}, qtype={dns.rdatatype.to_text(qtype)}, addr={qip}, latency={latency_ms:.3f} ms" + '\n'))
+                            os.write(file_handle, str.encode(log_line + '\n'))
 
                     if resp.rcode() == dns.rcode.NXDOMAIN:
                         domain_exists = False
@@ -160,12 +189,20 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
                                 if var.rdtype == dns.rdatatype.CNAME:
                                     cname_reply = str(i)
                             if latency_ms > 100 or high_latency is False:
+                                ans_line = f'"{latency_ms}";ans="{vname}";qip="{qip}";TTL={ttl}'
                                 if file_handle is not None:
-                                    os.write(file_handle, str.encode(f"\"{latency_ms}\";ans=\"{vname}\";qip=\"{qip}\";TTL={ttl}" + '\n'))
-                                print(f"\"{latency_ms}\";ans=\"{vname}\";qip=\"{qip}\";TTL={ttl}")
+                                    os.write(file_handle, str.encode(ans_line + '\n'))
+                                print(ans_line)
+
                         # Store TTL and latency information
                         if ttl is not None:
-                            query_stats.append({'latency': latency_ms, 'ttl': ttl, 'nameserver': vname, 'ip': qip, 'nsname': x['qname']})
+                            query_stats.append({
+                                'latency': latency_ms,
+                                'ttl': ttl,
+                                'nameserver': vname,
+                                'ip': qip,
+                                'nsname': x['qname'],
+                            })
                         ttl = None
                         vname = None
 #                        print("parsing resp.authority", time.time())
@@ -176,7 +213,7 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
 #                            print("var.name=", vname)
                             for i in var.items:
                                 # check NS responses
-                                if type(i) == dns.rdtypes.ANY.NS.NS:
+                                if i.rdtype == dns.rdatatype.NS:
                                     # both address families
                                     for fam in socket_types:
                                         str_name = str(i.to_text())
@@ -185,15 +222,26 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
                                         if add_info is not None:
                                             for a in add_info:
                                                 addr_list = a[4]
-                                                new_cache.append({'qname': str_name, 'af_type': a[0], 'addrinfo': addr_list[0]})
+                                                new_cache.append({
+                                                    'qname': str_name,
+                                                    'af_type': a[0],
+                                                    'addrinfo': addr_list[0],
+                                                })
                         # Store TTL and latency information
                         if ttl is not None:
-                            query_stats.append({'latency': latency_ms, 'ttl': var.ttl, 'nameserver': vname, 'ip': qip, 'nsname': x['qname']})
+                            query_stats.append({
+                                'latency': latency_ms,
+                                'ttl': ttl,
+                                'nameserver': vname,
+                                'ip': qip,
+                                'nsname': x['qname'],
+                            })
+
                 except dns.query.BadResponse as e:
                     print(f"error {e} querying {qip} for {full_qname}")
                     if file_handle is not None:
                         os.write(file_handle, str.encode(f"error {e} querying {qip} for {full_qname}\n"))
-                except dns.exception.Timeout as e:
+                except dns.exception.Timeout:
                     print(f"timeout querying: {qip} - {x['qname']}")
                     if file_handle is not None:
                         os.write(file_handle, str.encode(f"timeout querying: {qip} - {x['qname']}\n"))
@@ -211,11 +259,13 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
     min_max_range = max_value - min_value
     stddev = 0 if len(times) < 2 else statistics.stdev(times)
     min_max_ratio = 0 if min_value == 0 else max_value / min_value
-    print(f"latency: min={min_value:.3f} ms max={max_value:.3f} ms avg={avg_value:.3f} ms")
-    print(f"stdev={stddev:.3f} ms max-min={min_max_range:.3f} ms max/min={min_max_ratio:.2f} x latency variance")
+    latency = f"latency: min={min_value:.3f} ms max={max_value:.3f} ms avg={avg_value:.3f} ms"
+    variance = f"stdev={stddev:.3f} ms max-min={min_max_range:.3f} ms max/min={min_max_ratio:.2f} x latency variance"
+    print(latency)
+    print(variance)
     if file_handle is not None:
-        os.write(file_handle, str.encode(f"latency: min={min_value:.3f} ms max={max_value:.3f} ms avg={avg_value:.3f} ms" + '\n'))
-        os.write(file_handle, str.encode(f"stdev={stddev:.3f} ms max-min={min_max_range:.3f} ms max/min={min_max_ratio:.2f} x latency variance" + '\n'))
+        os.write(file_handle, str.encode(latency + '\n'))
+        os.write(file_handle, str.encode(variance + '\n'))
 
     if not domain_exists:
         print(f"NXDOMAIN for {full_qname}, stopping...")
@@ -224,18 +274,22 @@ def query_all(full_qname, prev_cache, qtype_list, tcp, file_handle, high_latency
         return ([], None, [])
     # See bug #5. This is to prevent some endless loops if we do not
     # progress in the domain name tree.
-    if sorted(new_cache, key=lambda ns: ns["qname"]) == \
-       sorted(prev_cache, key=lambda ns: ns["qname"]):
+    if sorted(new_cache, key=operator.itemgetter("qname")) == \
+       sorted(prev_cache, key=operator.itemgetter("qname")):
         new_cache = []
     return (new_cache, cname_reply, query_stats)
 
 
-def query_domain(fqdn, cli_args, socket_types, verbose=False):
-    """
-        query_domain starts the top of the query chain for each domain
-    """
-    root_hints = []
+def query_domain(
+        fqdn: str,
+        cli_args: argparse.Namespace,
+        socket_types: Sequence[socket.AddressFamily | int],
+        *,
+        verbose: bool = False,
+    ) -> str | None:
+    """ query_domain starts the top of the query chain for each domain """
 
+    root_hints = []
     all_ips = {}
     all_query_stats = []  # Store all query statistics
 
@@ -252,7 +306,7 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
                 ts = time.ctime()
                 print(f"start={ts}")
                 f.write(str.encode(f"start={ts}\n"))
-        except Exception as e:
+        except OSError as e:
             print(f"Error creating report file '{filename}': {e}")
             return None
 
@@ -267,7 +321,7 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
             os.write(fd, str.encode(f"Failed to resolve root nameservers: {e}\n"))
             os.close(fd)
         return None
-    except Exception as e:
+    except (dns.exception.DNSException, OSError) as e:
         print(f"Unexpected error resolving root nameservers: {e}")
         if fd is not None:
             os.write(fd, str.encode(f"Unexpected error resolving root nameservers: {e}\n"))
@@ -297,7 +351,7 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
 
     # run through the domain tree until done
     while len(old_cache) > 0:
-        af_to_qtype = {
+        af_to_qtype: dict[int, dns.rdatatype.RdataType] = {
             socket.AF_INET: dns.rdatatype.A,
             socket.AF_INET6: dns.rdatatype.AAAA,
         }
@@ -318,7 +372,7 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
 
     ts = time.ctime()
     print(f"end={ts}")
-    if fd is not None:
+    if fd is not None and filename is not None:
         try:
             fd = os.open(filename, os.O_WRONLY | os.O_APPEND)
             os.write(fd, str.encode(f"end={ts}" + '\n'))
@@ -330,13 +384,14 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
                     resp =  dns.query.udp(identity, ip, timeout=10)
                     for var in resp.answer:
                         for i in var.items:
-                            os.write(fd, str.encode(f"\"{ts}\";\"{ip}\";{i}" + '\n'))
-                            print(f"\"{ts}\";\"{ip}\";{i}")
-                except Exception as e:
+                            msg = f'"{ts}";"{ip}";{i}'
+                            os.write(fd, str.encode(msg + '\n'))
+                            print(msg)
+                except (dns.exception.DNSException, OSError) as e:
                     print(f"{e}:{ip}")
                     os.write(fd, str.encode(f"{e}:{ip}"))
                 os.write(fd, str.encode(f"mtr -bw {ip}\n"))
-        except Exception as e:
+        except OSError as e:
             print(f"Warning: Could not write to report file: {e}")
         finally:
             os.close(fd)
@@ -355,7 +410,7 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
                     'count': 0,
                     'latencies': [],
                     'nameservers': set(),
-                    'ttl': None
+                    'ttl': None,
                 }
             ttl_ranges[ttl_key]['count'] += 1
             ttl_ranges[ttl_key]['latencies'].append(stat['latency'])
@@ -401,7 +456,7 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
             print(f"\nDelegation: {delegation}")
             print(f"Number of queries: {data['count']}")
             print(f"TTL: {data['ttl']}")
-            print(f"Latency statistics (ms):")
+            print("Latency statistics (ms):")
             print(f"  Average: {avg_latency:.2f}")
             print(f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})")
             print(f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})")
@@ -418,7 +473,7 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
                 os.write(fd, str.encode(f"\nDelegation: {delegation}\n"))
                 os.write(fd, str.encode(f"Number of queries: {data['count']}\n"))
                 os.write(fd, str.encode(f"TTL: {data['ttl']}\n"))
-                os.write(fd, str.encode(f"Latency statistics (ms):\n"))
+                os.write(fd, str.encode("Latency statistics (ms):\n"))
                 os.write(fd, str.encode(f"  Average: {avg_latency:.2f}\n"))
                 os.write(fd, str.encode(f"  Min: {min_latency:.2f} (IP: {min_ip}, NS: {min_ns})\n"))
                 os.write(fd, str.encode(f"  Max: {max_latency:.2f} (IP: {max_ip}, NS: {max_ns})\n"))
@@ -497,8 +552,8 @@ def main() -> None:
     parser.add_argument('domains', nargs='+', help="one or more domain names to query")  # allow multiple domains
 
     ip_group = parser.add_mutually_exclusive_group()
-    ip_group.add_argument('-4', '--ipv4', action='store_true', help="query ipv4-only")  # ipv6-only
-    ip_group.add_argument('-6', '--ipv6', action='store_true', help="query ipv6-only")  # ipv4-only
+    ip_group.add_argument('-4', '--ipv4', action='store_true', help="query ipv4-only")
+    ip_group.add_argument('-6', '--ipv6', action='store_true', help="query ipv6-only")
 
     parser.add_argument('-t', '--tcp', action='store_true', help="send queries over TCP")  # use TCP
     parser.add_argument('-r', '--report', metavar='REPORT_FILE', type=str, help="Save results to specified file")
