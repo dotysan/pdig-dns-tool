@@ -460,6 +460,25 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
     return filename
 # end query_domain
 
+
+def has_ipv6_connectivity() -> bool:
+    """Test if IPv6 connectivity is available by attempting to connect to a root server.
+
+    Returns:
+        bool: True if IPv6 connectivity is available, False otherwise.
+    """
+
+    test_addr = "2001:503:ba3e::2:30"  # a.root-servers.net IPv6
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1)
+            sock.connect((test_addr, 53))
+    except OSError:
+        return False
+    else:
+        return True
+
+
 # main()
 
 # define a parser
@@ -483,6 +502,11 @@ socket_af_types = (
     [socket.AF_INET6] if args.ipv6 else
     [socket.AF_INET, socket.AF_INET6]
 )
+
+# Auto-detect and filter unavailable address families
+if socket.AF_INET6 in socket_af_types and not has_ipv6_connectivity():
+    print("Note: IPv6 connectivity unavailable, using IPv4 only")
+    socket_af_types = [socket.AF_INET]
 
 # XXX Replace me if you are going to use -u flag
 url = "https://www.example.com/upload/upload_file.php"
