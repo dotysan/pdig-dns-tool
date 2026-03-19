@@ -310,7 +310,13 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
 
     # run through the domain tree until done
     while len(old_cache) > 0:
-        (reply_hints, new_domain, query_stats) = query_all(fqdn, old_cache, [dns.rdatatype.AAAA], cli_args.tcp, fd, cli_args.gt, all_ips, socket_types)
+        af_to_qtype = {
+            socket.AF_INET: dns.rdatatype.A,
+            socket.AF_INET6: dns.rdatatype.AAAA,
+        }
+        qtype_list = [af_to_qtype[af] for af in socket_types]
+        (reply_hints, new_domain, query_stats) = query_all(
+            fqdn, old_cache, qtype_list, cli_args.tcp, fd, cli_args.gt, all_ips, socket_types)
         all_query_stats.extend(query_stats)
         old_cache = reply_hints
         if new_domain is not None:
@@ -459,8 +465,11 @@ def query_domain(fqdn, cli_args, socket_types, verbose=False):
 # define a parser
 parser = argparse.ArgumentParser(prog=sys.argv[0])
 parser.add_argument('domains', nargs='+', help="one or more domain names to query") # allow multiple domains
-parser.add_argument('-6', '--ipv6', action='store_true', help="query ipv6-only") # ipv6-only
-parser.add_argument('-4', '--ipv4', action='store_true', help="query ipv4-only") # ipv4-only
+
+ip_group = parser.add_mutually_exclusive_group()
+ip_group.add_argument('-4', '--ipv4', action='store_true', help="query ipv4-only")  # ipv6-only
+ip_group.add_argument('-6', '--ipv6', action='store_true', help="query ipv6-only")  # ipv4-only
+
 parser.add_argument('-t', '--tcp', action='store_true', help="send queries over TCP") # use TCP
 parser.add_argument('-r', '--report', metavar='REPORT_FILE', type=str, help="Save results to specified file")
 parser.add_argument('-g', '--gt', action='store_true', help="greater than 100ms only")
@@ -469,12 +478,11 @@ parser.add_argument('-v', '--verbose', action='store_true', help="enable verbose
 
 args = parser.parse_args()
 
-# Validate mutually exclusive arguments
-if args.ipv4 and args.ipv6:
-    print("Error: Cannot specify both --ipv4 and --ipv6")
-    sys.exit(1)
-
-socket_af_types = [socket.AF_INET, socket.AF_INET6]
+socket_af_types = (
+    [socket.AF_INET] if args.ipv4 else
+    [socket.AF_INET6] if args.ipv6 else
+    [socket.AF_INET, socket.AF_INET6]
+)
 
 # XXX Replace me if you are going to use -u flag
 url = "https://www.example.com/upload/upload_file.php"
