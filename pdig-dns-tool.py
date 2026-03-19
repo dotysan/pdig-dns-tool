@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#! /usr/bin/env -S uv run --script --python=3
 # /// script
 # dependencies = [
 #     "dnspython",
